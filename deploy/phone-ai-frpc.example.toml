@@ -1,0 +1,18 @@
+# Copy to a private deployment directory and replace every placeholder.
+# Do not commit the filled-in file.
+serverAddr = "YOUR_FRP_SERVER"
+serverPort = 7000
+
+[[proxies]]
+name = "phone-ai-audio"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 18880
+remotePort = 18880
+
+[[proxies]]
+name = "phone-ai-device"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 18882
+remotePort = 18882

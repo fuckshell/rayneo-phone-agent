@@ -1,6 +1,12 @@
 # Runtime data and local credentials
 *.jsonl
 *.log
+phone-assistant/build/
+phone-assistant/release/
+deploy/runtime-logs/
+deploy/audio-sessions/
+deploy/watchdog-status.json
+deploy/*.local.*
 *.db
 *.sqlite*
 *.ics
