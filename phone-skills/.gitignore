@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+audio_sessions/
+data/
+*.log
+*.jsonl
+*.db
+*.sqlite*
+*.ics
+*.wav
+*.mp3
+.env*
+*token*
+*secret*
