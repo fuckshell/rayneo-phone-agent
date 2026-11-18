@@ -33,3 +33,20 @@ separate signing step; never commit that APK or its keystore.
 The Python tests inspect the Android contract and the JVM test covers the
 deterministic rhythm policy. Device, root, Health Connect, and location
 features require explicit permission on the target phone.
+
+To run the six host-side pet and translation checks with a JDK (PowerShell,
+from this directory):
+
+```powershell
+$classes = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Path $classes | Out-Null
+$names = 'PetMotion','PetDrag','PetGeometry','PetAnimationPolicy','PageTranslationResult','TranslationCache'
+$sources = foreach ($n in $names) { "src/com/zeyu/phoneai/assistant/$n.java"; "tests/${n}Test.java" }
+javac -encoding UTF-8 -d $classes $sources
+if ($LASTEXITCODE) { throw 'Compilation failed' }
+foreach ($n in $names) {
+    $class = if ($n -in 'PageTranslationResult','TranslationCache') { "com.zeyu.phoneai.assistant.${n}Test" } else { "${n}Test" }
+    java -cp $classes $class
+    if ($LASTEXITCODE) { throw "$class failed" }
+}
+```

@@ -16,12 +16,23 @@ import urllib.request
 import datetime as _dt
 import re
 import base64
-import struct
 import time
 import queue
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from .audio_signal import pcm_signal
+from .power_intent import (
+    _command_text,
+    is_shutdown_request,
+    is_bootloader_request,
+    is_reboot_request,
+    is_shutdown_confirmation,
+    is_power_confirmation,
+    is_shutdown_cancellation,
+    is_power_cancellation,
+    power_request_kind,
+)
 from .task_router import route_task
 from .gemini_config import DEFAULT_MODEL, gemini_model
 from .model import SkillError
@@ -32,81 +43,6 @@ from .storage import atomic_json
 
 _SHUTDOWN_CONFIRM_TTL = 90.0
 _POWER_CONFIRM_TTL = _SHUTDOWN_CONFIRM_TTL
-
-
-def _command_text(text: str) -> str:
-    """Normalize only spacing/punctuation for deterministic safety checks."""
-    value = str(text or "").translate(str.maketrans({
-        "關": "关", "閉": "闭", "機": "机", "確": "确", "認": "认",
-        "決": "决", "定": "定", "是": "是",
-    }))
-    return re.sub(r"[\s\u3000，。！？!?、；;：:‘’“”\"'（）()【】\[\]{}]+", "", value).casefold()
-
-
-def is_shutdown_request(text: str) -> bool:
-    """Recognize a direct shutdown request, never a settings question."""
-    value = _command_text(text)
-    if not value or any(word in value for word in ("重启", "重新启动", "恢复出厂", "格式化")):
-        return False
-    return value in {
-        "关机", "手机关机", "关闭手机", "关掉手机", "关一下机", "把手机关了",
-        "帮我关机", "请关机", "我要关机", "现在关机", "关闭设备", "关掉设备",
-    }
-
-
-def is_bootloader_request(text: str) -> bool:
-    """Recognize an explicit reboot-to-bootloader request."""
-    value = _command_text(text)
-    if not value or "重启" not in value and "重新启动" not in value and "进入" not in value:
-        return False
-    return any(target in value for target in (
-        "bootloader", "fastboot", "引导模式", "引导程序", "引导加载程序", "刷机模式",
-    ))
-
-
-def is_reboot_request(text: str) -> bool:
-    """Recognize a direct reboot request, excluding bootloader mode."""
-    value = _command_text(text)
-    if is_bootloader_request(value) or not value:
-        return False
-    return value in {
-        "重启", "重新启动", "重启手机", "重新启动手机", "重启设备", "重新启动设备",
-        "帮我重启", "请重启", "请重启手机", "我要重启", "现在重启", "把手机重启一下", "重启一下手机",
-    }
-
-
-def is_shutdown_confirmation(text: str) -> bool:
-    """Accept only explicit confirmation words for an existing pending request."""
-    return _command_text(text) in {"确认", "确认关机", "确定", "确定关机", "是", "是的"}
-
-
-def is_power_confirmation(text: str, kind: str) -> bool:
-    value = _command_text(text)
-    if value in {"确认", "确定", "是", "是的"}:
-        return True
-    return value in {f"确认{kind}", f"确定{kind}", f"是{kind}", f"确认重启到{kind}"}
-
-
-def is_shutdown_cancellation(text: str) -> bool:
-    return _command_text(text) in {"取消", "不要", "不要关机", "取消关机", "别关机", "不关机"}
-
-
-def is_power_cancellation(text: str, kind: str) -> bool:
-    value = _command_text(text)
-    if value in {"取消", "不要", "别", "算了"}:
-        return True
-    return value in {f"取消{kind}", f"不要{kind}", f"别{kind}", f"不{kind}"}
-
-
-def power_request_kind(text: str) -> str | None:
-    """Return the fixed power action, with bootloader taking precedence."""
-    if is_bootloader_request(text):
-        return "bootloader"
-    if is_reboot_request(text):
-        return "reboot"
-    if is_shutdown_request(text):
-        return "shutdown"
-    return None
 
 
 class AudioSessions:
@@ -375,24 +311,6 @@ class AudioSessions:
             del turns[:-12]
         (self.output_dir / (session_id + ".json")).write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
         return result
-
-
-def pcm_signal(pcm: bytes) -> dict[str, Any]:
-    """Cheap fail-closed voice gate for signed 16-bit mono PCM."""
-    if len(pcm) < 640 or len(pcm) % 2:
-        return {"speech_like": False, "rms": 0, "voiced_frames": 0, "frames": 0}
-    samples = struct.unpack("<%dh" % (len(pcm) // 2), pcm)
-    frame = 320  # 20 ms at 16 kHz
-    threshold = int(os.environ.get("PHONE_AI_MIN_RMS", "220"))
-    values = []
-    for start in range(0, len(samples) - frame + 1, frame):
-        part = samples[start:start + frame]
-        rms = int((sum(x * x for x in part) / frame) ** 0.5)
-        values.append(rms)
-    voiced = sum(r >= threshold for r in values)
-    overall = int((sum(x * x for x in samples) / len(samples)) ** 0.5)
-    return {"speech_like": voiced >= 2 and overall >= threshold,
-            "rms": overall, "voiced_frames": voiced, "frames": len(values)}
 
 
 def openclaw_answer(text: str, context: str, request_id: str) -> dict[str, Any]:

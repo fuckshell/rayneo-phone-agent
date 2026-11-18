@@ -10,6 +10,9 @@
 - `phone-skills/`：手机 Agent 的本地连接、语音/视觉入口、模型客户端、天气/地点/日历等通用模块。
 - `phone-assistant/`：可选的 Android 端语音入口、无障碍操作桥、作息/定位/睡眠同步和本地 relay。只发布源码和测试，不发布 APK、签名文件或构建产物。
 - `deploy/`：端口说明和脱敏的 Windows/FRP 配置模板；模板中的服务器地址、令牌和路径都必须由部署者填写。
+- [wechat-agent/](wechat-agent/)：处理已取得的消息和本地文件，包含群提及判断、附件摘要、澄清证据校验及记忆任务恢复模块。这些模块不连接微信客户端。
+
+手机端按调用方向阅读：`phone-assistant/src/` 中的 Android 组件采集输入，`phone-skills/phone_skills/audio_bridge.py` 接收请求。语音判定在 `audio_signal.py`，电源口令识别在 `power_intent.py`；后台任务的持久化与通知在 `audio_jobs.py` 和 `image_jobs.py`。公开版提供队列类，不包含生产图片服务。Android 下的六组桌宠、译文校验和缓存 JVM 测试可脱离手机运行。
 
 网页仪表盘、微信/OpenClaw 私有日历管线、个人档案、聊天数据和运行日志不在公开仓库中。它们依赖个人 Feishu 授权和本机数据，不能通过复制公开代码复现。
 
@@ -25,10 +28,11 @@
 
 ```bash
 node --test rayneo/rayneo-agent-sync.test.js
+node --test wechat-agent/tests/policy.test.js
 python -m compileall -q phone-skills/phone_skills
 ```
 
-手机端完整测试需要额外的设备适配器和可选依赖，未随公开版发布；公开版只运行不会触碰设备的编译检查。
+Android 的 JVM 验证方法见 [客户端说明](phone-assistant/README.md)。真机、模型服务与私有适配器的端到端测试不在公开版中。
 
 ## 免责声明
 
