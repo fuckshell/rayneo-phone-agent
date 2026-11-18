@@ -1,0 +1,92 @@
+diff --git a/vision_calendar_bridge.py b/vision_calendar_bridge.py
+--- a/vision_calendar_bridge.py
++++ b/vision_calendar_bridge.py
+@@ -585,6 +585,34 @@ def completed_flash_result(row: dict) -> bool:
+ 
+ def get_schedule_vision_text(path: Path, sha: str, row: dict, *, allow_run: bool = False) -> str:
+     """Read shared schedule_ocr cache only; vision runs in distill_media.ensure_schedule_ocr."""
++    # A completed upstream decision closes calendar screening, not a future
++    # user request for detail. Do this before the OCR cache and inference lock.
++    from image_retry import cached_coarse_screening, is_requested
++    from image_store import is_flash_record
++    from vision_pipeline import verified_coarse_source, is_interactive_vision_ready
++    if (sha and sha == row.get("file_sha") and not is_requested(row)
++            and verified_coarse_source(row, path)):
++        thumb = row.get("thumbnail_sha256") or sha
++        middle = (row.get("captured_tier") == "middle" and row.get("middle_sha256") == sha
++                  and is_interactive_vision_ready(row, path))
++        receipt = cached_coarse_screening(thumb) if thumb == sha or middle else {}
++        if (receipt.get("ok") is True and is_flash_record(receipt)
++                and receipt.get("screening_decision") == "summary_complete"
++                and receipt.get("screening_relevance") == "irrelevant"
++                and isinstance(receipt.get("evidence"), list) and receipt["evidence"]
++                and all(isinstance(s, str) and s.strip() for s in receipt["evidence"])
++                and str(receipt.get("screening_reason") or "").strip()):
++            locator = native_middle_source(row, (Path.home() / "key_ctrler"))
++            row["_calendar_triage"] = {
++                "relevance": "irrelevant", "reason": "upstream-screening-complete",
++                "summary": receipt.get("answer") or receipt.get("summary") or "",
++                "provider": receipt["provider"], "model": receipt["model"],
++                "evidence": receipt["evidence"], "screening_reason": receipt["screening_reason"],
++                "source": {"message_key": row.get("message_key") or row.get("id"),
++                           "thumbnail_sha256": thumb, "middle_path": str(path) if middle else None,
++                           "middle_cache_locator": str(locator) if locator else None},
++            }
++            return ""
+     cached = get_schedule_ocr(sha) or migrate_legacy_schedule_ocr(sha)
+     if cached and not is_weak_summary(cached) and "无法帮助" not in cached:
+         return cached.strip()
+diff --git a/test_thumbnail_screening.py b/test_thumbnail_screening.py
+--- a/test_thumbnail_screening.py
++++ b/test_thumbnail_screening.py
+@@ -64,12 +64,50 @@ class ThumbnailScreening(unittest.TestCase):
+                 result, _ = self.triage(dict(relevance='irrelevant', content_type=kind, reason='文字模糊'))
+                 self.assertEqual(result['relevance'], 'uncertain')
+ 
++    def test_repeat_message_accepts_upstream_decision_without_detail_or_ocr(self):
++        receipt = dict(ok=True, provider='gemini', model='gemini-flash',
++                       screening_relevance='irrelevant', screening_decision='summary_complete',
++                       content_type='table', screening_reason='学生作业，不含教师个人任务',
++                       evidence=['学生作业、学科、用时'])
++        with patch.object(image_retry, 'cached_coarse_screening', return_value=receipt), \
++             patch.object(b, 'get_schedule_ocr', side_effect=AssertionError('unexpected OCR')):
++            self.assertEqual(b.get_schedule_vision_text(self.path, self.sha, self.row), '')
++        src = self.row['_calendar_triage']['source']
++        self.assertEqual(src['message_key'], self.row['message_key'])
++        self.assertIsNone(src['middle_path'])
++        with patch.object(image_retry, 'is_requested', return_value=True), \
++             patch.object(b, 'get_schedule_ocr', return_value='explicit follow-up OCR result'):
++            self.assertEqual(b.get_schedule_vision_text(self.path, self.sha, dict(self.row)),
++                             'explicit follow-up OCR result')
++
+     def test_mismatched_bytes_never_reach_model_or_cache(self):
+         with patch.object(b, 'get_thumb_record') as cache:
+             result, model = self.triage({}, file_sha='a'*64)
+         self.assertEqual(result['reason'], 'coarse-source-not-verified')
+         model.assert_not_called(); cache.assert_not_called()
+ 
++    def test_handoff_reports_only_verified_middle_path(self):
++        from PIL import Image
++        path = self.path.with_name('middle.png')
++        Image.new('RGB', (600, 800), 'black').save(path)
++        middle = hashlib.sha256(path.read_bytes()).hexdigest()
++        receipt = dict(ok=True, provider='gemini', model='gemini-flash',
++                       screening_relevance='irrelevant', screening_decision='summary_complete',
++                       screening_reason='No personal task', evidence=['Student exercise'])
++        row = dict(self.row, captured_tier='middle', middle_pending=False,
++                   middle_sha256=middle, file_sha=middle)
++        with patch.object(image_retry, 'cached_coarse_screening', return_value=receipt) as cache:
++            self.assertEqual(b.get_schedule_vision_text(path, middle, row), '')
++            cache.assert_called_once_with(self.sha)
++            self.assertEqual(row['_calendar_triage']['source']['middle_path'], str(path))
++        stale = dict(row)
++        del stale['_calendar_triage']
++        with patch.object(image_retry, 'cached_coarse_screening') as cache, \
++             patch.object(b, 'get_schedule_ocr', return_value='ordinary fallback read'):
++            b.get_schedule_vision_text(self.path, middle, stale)
++        cache.assert_not_called()
++        self.assertNotIn('_calendar_triage', stale)
++
+     def test_explicit_question_requires_middle(self):
+         with patch.object(image_retry, 'is_requested', return_value=True):
+             result, model = self.triage({})
