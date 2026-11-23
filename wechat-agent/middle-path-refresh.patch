@@ -1,0 +1,76 @@
+--- a/wechat-ingest.js
++++ b/wechat-ingest.js
+@@ -4689,4 +4689,25 @@
+ }
+ 
++function refreshStaleMiddlePaths() {
++  let changed = 0;
++  for (const job of postprocessJobs.values()) {
++    const event = job.event;
++    if (!["queued", "retry"].includes(job.status) || event?.media_kind !== "image" ||
++        !event.media_message_key || !(event.media_middle_pending === true ||
++        event.media_captured_tier === "thumbnail")) continue;
++    const source = verifiedManifestMiddleSource(job);
++    if (!source || source.sha === event.media_thumbnail_sha256) continue;
++    Object.assign(event, {
++      media_path: source.file, media_file: source.file, media_canonical_file: source.file,
++      media_file_sha256: source.sha, media_middle_sha256: source.sha,
++      media_captured_tier: source.tier, media_middle_pending: false,
++      media_status: "ready",
++    });
++    changed++;
++  }
++  if (changed) writePostprocessJobs();
++  return {changed};
++}
++
+ function reconcileCompletedManifestEvidence(now = new Date().toISOString()) {
+   let completed = 0;
+@@ -5553,4 +5574,5 @@
+   reconcileCodexRepairReceipts();
+   reconcileRecoveredMediaJobs();
++  refreshStaleMiddlePaths();
+   reconcileCompletedManifestEvidence();
+   setInterval(() => reconcileCodexRepairReceipts(), 5000).unref();
+@@ -5558,4 +5580,5 @@
+     reconcileRecoveredMediaJobs();
+     reconcileCompletedManifestEvidence();
++    refreshStaleMiddlePaths();
+   }, 30000).unref();
+   // Keep historical retry/repair work alive after the worker drains. This is
+@@ -5632,4 +5655,5 @@
+   verifiedManifestMiddleSource,
+   reconcileRecoveredMediaJobs,
++  refreshStaleMiddlePaths,
+   resolveMediaContext,
+   uploadedSpreadsheetQueryResult,
+--- a/tests/recovered-middle-reconciliation.test.js
++++ b/tests/recovered-middle-reconciliation.test.js
+@@ -142,2 +142,27 @@
+   assert.equal(saved[1].last_error, "image-tier-not-ready");
+ });
++
++test("refreshes only the verified source and preserves downstream failures", () => {
++  const {refreshStaleMiddlePaths} = require("../wechat-ingest");
++  const file = path.join(root, "new-middle.jpg");
++  fs.writeFileSync(file, "new middle");
++  const key = "chat@chatroom|23|1795050023|server-23";
++  const middle = sha(fs.readFileSync(file)), thumb = "a".repeat(64);
++  const job = imageJob("business-pending", key, "table-consensus-failed", thumb, 23);
++  job.result = {vision_calendar: {result: {reason: "online-clarification-required"}}};
++  job.evidence_status = "awaiting-evidence";
++  const row = {message_key: key, talker: job.event.talker, file, captured_tier: "middle",
++    kind: "image", status: "pending", middle_sha256: middle, thumbnail_sha256: thumb};
++  writeJobs([job]);
++  writeManifest([{...row, middle_sha256: thumb}]);
++  assert.equal(refreshStaleMiddlePaths().changed, 0);
++  writeManifest([row]);
++  assert.equal(refreshStaleMiddlePaths().changed, 1);
++  assert.equal(refreshStaleMiddlePaths().changed, 0);
++  const saved = JSON.parse(fs.readFileSync(process.env.WECHAT_POSTPROCESS_JOB_FILE)).jobs.find(j => j.id === job.id);
++  assert.equal(saved.event.media_path, file);
++  assert.equal(saved.event.media_file_sha256, middle);
++  for (const field of ["status", "last_error", "result", "evidence_status", "attempts"]) {
++    assert.deepEqual(saved[field], job[field]);
++  }
++});
