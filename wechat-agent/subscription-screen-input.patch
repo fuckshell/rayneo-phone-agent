@@ -1,0 +1,85 @@
+--- a/skills/wechat-calendar/context_calendar_pipeline.py
++++ b/skills/wechat-calendar/context_calendar_pipeline.py
+@@ -220,3 +220,4 @@
+ 
+-def local_screen_request(bundle, *, arrangements=None):
++def local_screen_request(bundle, *, arrangements=None, subscription=False):
++    from screening_payload import screen_json
+     bundle = {**bundle, "existing_arrangements": (
+@@ -276,3 +277,3 @@
+         '{"relevance":"relevant|irrelevant|uncertain","reason":"依据","context_indices":[0],"unchanged_event_uids":[]}\n'
+-        + json.dumps(bundle, ensure_ascii=False)
++        + (screen_json(bundle) if subscription else json.dumps(bundle, ensure_ascii=False))
+     )
+@@ -297,3 +298,3 @@
+     from antigravity_screen import screen
+-    return screen(local_screen_request(bundle, arrangements=arrangements))
++    return screen(local_screen_request(bundle, arrangements=arrangements, subscription=True))
+ 
+--- /dev/null
++++ b/skills/wechat-calendar/screening_payload.py
+@@ -0,0 +1,32 @@
++"""Serialize classification evidence without repeating identical message text."""
++import json
++
++
++def _screen_row(row):
++    if not isinstance(row, dict):
++        return row
++    content = row.get("content")
++    media = row.get("media_context")
++    if (isinstance(content, str) and len(content) >= 64 and isinstance(media, dict)
++            and media.get("summary") == content and "summary_ref" not in media):
++        media = dict(media)
++        del media["summary"]
++        media["summary_ref"] = "content"
++        row = {**row, "media_context": media}
++    return row
++
++
++def screen_json(bundle):
++    message = bundle.get("message")
++    if isinstance(message, dict):
++        rows = message.get("context")
++        for row in [message, *(rows if isinstance(rows, list) else [])]:
++            media = row.get("media_context") if isinstance(row, dict) else None
++            if isinstance(media, dict) and "summary_ref" in media:
++                return json.dumps(bundle, ensure_ascii=False)
++        message = _screen_row(message)
++        if isinstance(message.get("context"), list):
++            message = {**message, "context": [_screen_row(row) for row in message["context"]]}
++        bundle = {**bundle, "message": message}
++    return ("媒体字段 summary_ref 为 content 时，摘要逐字等于同一条消息的 content。\n"
++            + json.dumps(bundle, ensure_ascii=False, separators=(",", ":")))
+--- /dev/null
++++ b/skills/wechat-calendar/test_screening_payload.py
+@@ -0,0 +1,29 @@
++"""An identical summary can be restored without changing evidence or row indices."""
++import copy
++import json
++import unittest
++
++from screening_payload import screen_json
++
++
++class ScreeningPayloadTest(unittest.TestCase):
++    def test_roundtrip_preserves_actor_order_originals_and_paths(self):
++        text = "逐字保留原件和换行\n" * 60
++        def row(author, summary):
++            return dict(sender=author, time="10:00", content=text,
++                        media_context=dict(summary=summary, file="synthetic.png"))
++        data = dict(message={**row("a", text), "context": [
++            row("b", text), row("c", text+"!"), row("d", ""), None]},
++            source={"id":1})
++        before = copy.deepcopy(data)
++        rendered = screen_json(data)
++        compact = json.loads(rendered.split("\n", 1)[1])
++        current = compact["message"]
++        self.assertEqual(current["media_context"]["summary_ref"], "content")
++        self.assertEqual(current["context"][0]["media_context"]["summary_ref"], "content")
++        for item in [current, *current["context"]]:
++            if item and item["media_context"].pop("summary_ref", None) == "content":
++                item["media_context"]["summary"] = item["content"]
++        self.assertEqual(before, compact)
++        self.assertEqual(before, data)
++        self.assertLess(len(rendered), len(json.dumps(data, ensure_ascii=False)))
