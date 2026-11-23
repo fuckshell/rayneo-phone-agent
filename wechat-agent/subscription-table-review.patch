@@ -1,0 +1,223 @@
+--- a/skills/wechat-media/scoped_table_consensus.py
++++ b/skills/wechat-media/scoped_table_consensus.py
+@@ -378,3 +378,48 @@
+     result.update(provider=records[0]['provider'],model=records[0]['model'],
+                   source_sha256=source_sha,read_receipts=[str(p) for p in paths])
+     return result
++
++
++def _single_cell_difference(first, second):
++    before, after = _full_table_layout(first), _full_table_layout(second)
++    if len(before) != len(after):
++        return False
++    differences = 0
++    for left, right in zip(before, after):
++        if left[:-1] != right[:-1]:
++            return False
++        if left[0] == 'text':
++            if left != right:
++                return False
++            continue
++        if len(left[-1]) != len(right[-1]):
++            return False
++        for row, other in zip(left[-1], right[-1]):
++            if len(row) != len(other):
++                return False
++            differences += sum(x != y for x, y in zip(row, other))
++    return differences == 1
++
++
++def verify_table_pair(paths, source_sha, root, *, independent_read):
++    """Break a one-cell tie only with an independent, matching full table."""
++    try:
++        return from_receipts(paths, source_sha, root)
++    except ValueError as error:
++        if str(error) != 'full-table-reads-disagree':
++            raise
++    records = [json.loads(Path(path).read_text()) for path in paths]
++    if not _single_cell_difference(*(record['response'] for record in records)):
++        return None
++    # A fixed blind prompt reuses the subscription inference cache on retries.
++    review = independent_read()
++    if not review.get('ok') or not review.get('read_receipt'):
++        return None
++    for original in paths:
++        try:
++            result = from_receipts([original, review['read_receipt']], source_sha, root)
++        except ValueError:
++            continue
++        if result.get('projection', {}).get('kind') == 'full-table':
++            return result
++    return None
+--- a/skills/wechat-media/vision_pipeline.py
++++ b/skills/wechat-media/vision_pipeline.py
+@@ -1033,7 +1033,7 @@
+     return "\n".join(parts)
+ 
+ 
+-def _structured_table_read(path: Path, prompt: str) -> dict:
++def _structured_table_read(path: Path, prompt: str, *, subscription_only: bool = False) -> dict:
+     # Header metadata embedded in free prose was repeatedly omitted. Both
+     # providers now receive the same explicit, required structured contract.
+     prompt += (
+@@ -1064,9 +1064,10 @@
+     try:
+         # provider_fallback.infer performs Antigravity Flash first and invokes
+         # the durable Gemini API gateway only after a provider failure.
+-        value = subscription_infer(
+-            prompt, image=path, schema=TABLE_OCR_SCHEMA, timeout=120,
+-        )
++        reader = subscription_infer
++        if subscription_only:
++            from inference import infer as reader
++        value = reader(prompt, image=path, schema=TABLE_OCR_SCHEMA, timeout=120)
+         provider = getattr(value, "inference_provider", provider)
+         model = getattr(value, "inference_model", model)
+         # Retain the actual provider response before validation. A matrix
+@@ -2177,8 +2178,13 @@
+                         gem = {**check, "ok": False}
+                     elif rows != checked_rows:
+                         try:
+-                            from scoped_table_consensus import from_receipts
+-                            scoped = from_receipts([gem["read_receipt"], check["read_receipt"]], file_sha, WORKSPACE)
++                            from scoped_table_consensus import verify_table_pair
++                            scoped = verify_table_pair(
++                                [gem["read_receipt"], check["read_receipt"]], file_sha, WORKSPACE,
++                                independent_read=lambda: _structured_table_read(
++                                    path, "独立读取此图全部原文，保留表外通知，再按物理行列逐格核对。务必看清每个字，按图中写法输出，不能猜测或改写。",
++                                    subscription_only=True),
++                            )
+                         except (KeyError, ValueError, OSError, TypeError):
+                             scoped = None
+                         gem = scoped or {"ok": False, "reason": "table-consensus-failed",
+--- /dev/null
++++ b/skills/wechat-media/test_subscription_table_tie.py
+@@ -0,0 +1,59 @@
++import copy
++import hashlib
++import json
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import Mock, patch
++
++import vision_pipeline as vision
++from scoped_table_consensus import verify_table_pair
++
++
++class TableReviewTests(unittest.TestCase):
++    def setUp(self):
++        self.folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
++        self.image = self.folder / 'test.png'
++        self.image.write_bytes(b'test source')
++        self.sha = hashlib.sha256(self.image.read_bytes()).hexdigest()
++        self.first = {'blocks': [{'text': 'Sample', 'rows': [], 'header_depth': 0},
++                        {'text': '', 'header_depth': 1, 'rows': [['Name', 'Value'], ['A', '42']]}]}
++        self.second = copy.deepcopy(self.first)
++        self.second['blocks'][1]['rows'][1][1] = '43'
++
++    def receipt(self, name, response, sha=None):
++        path = self.folder / (name + '.json')
++        path.write_text(json.dumps({'source_sha256': sha or self.sha,
++            'prompt_sha256': hashlib.sha256(name.encode()).hexdigest(),
++            'provider':'antigravity-subscription','model':'gemini-3.8-flash-medium',
++            'response':response}))
++        return path
++
++    def check(self, third):
++        first = self.receipt('first', self.first)
++        second = self.receipt('second', self.second)
++        return verify_table_pair([first, second], self.sha, self.folder, independent_read=third)
++
++    def test_accepted_only_if_independent_full_read_agrees(self):
++        for response in (self.first, self.second):
++            third = Mock(return_value={'ok':True, 'read_receipt': self.receipt('third', response)})
++            self.assertEqual(self.check(third)['answer'], vision._table_blocks_answer(response))
++            third.assert_called_once_with()
++        other = copy.deepcopy(self.second)
++        other['blocks'][1]['rows'][1][1] = '44'
++        self.assertIsNone(self.check(lambda: {'ok':True,'read_receipt':self.receipt('third', other)}))
++        self.assertIsNone(self.check(lambda: {'ok':True,'read_receipt':self.receipt('third', self.first, 'f'*64)}))
++
++    def test_prose_or_shape_changes_require_normal_recovery(self):
++        third = Mock(side_effect=AssertionError('unexpected third read'))
++        self.second['blocks'][0]['text'] = 'Different'
++        self.assertIsNone(self.check(third))
++        self.second['blocks'][0]['text'] = 'Sample'
++        self.second['blocks'][1]['rows'].append(['B', '1'])
++        self.assertIsNone(self.check(third))
++
++    def test_subscription_only_review_has_no_paid_fallback(self):
++        import inference
++        with patch.object(vision, 'subscription_infer', side_effect=AssertionError('unexpected fallback')), \
++             patch.object(inference, 'infer', side_effect=inference.InferenceUnavailable('offline')):
++            self.assertFalse(vision._structured_table_read(self.image, 'read', subscription_only=True)['ok'])
+--- a/skills/wechat-media/test_structured_table_headers.py
++++ b/skills/wechat-media/test_structured_table_headers.py
+@@ -28,2 +28,8 @@
+ 
++    def setUp(self):
++        fixture_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
++        self.image = fixture_dir / 'fixture.png'
++        self.image.write_bytes(b'table fixture')
++        self.enterContext(patch.object(vision, 'WORKSPACE', fixture_dir))
++
+     def value(self, depth=3):
+@@ -43,3 +49,3 @@
+ 
+-    def detail(self, second, *, first=None, check_prompt=None):
++    def detail(self, second, *, first=None, check_prompt=None, expect_review=False):
+         with ExitStack() as stack:
+@@ -55,3 +61,3 @@
+             model = stack.enter_context(patch.object(inference, 'infer',
+-                side_effect=[self.value() if first is None else first, second]))
++                side_effect=[self.value() if first is None else first, second, inference.InferenceUnavailable('offline')]))
+             paid = stack.enter_context(patch.object(media, 'call',
+@@ -61,3 +67,3 @@
+                 image_store.SCHEDULE_OCR_QUESTION, manifest_row={'message_key': 'fixture'})
+-            self.assertEqual(model.call_count, 2)
++            self.assertEqual(model.call_count, 3 if expect_review else 2)
+             for call in model.call_args_list:
+@@ -81,3 +87,3 @@
+             with self.subTest(second=second):
+-                result, saved = self.detail(second)
++                result, saved = self.detail(second, expect_review=second is changed)
+                 self.assertFalse(result['ok'])
+@@ -147,3 +153,3 @@
+             with self.subTest(expected=expected):
+-                result, saved = self.detail(second, first=full, check_prompt=check_prompt)
++                result, saved = self.detail(second, first=full, check_prompt=check_prompt, expect_review=second is filled)
+                 self.assertEqual(result['ok'], expected)
+@@ -171,5 +177,5 @@
+     def test_subscription_failure_uses_schema_bound_serial_fallback_once(self):
+-        with patch.object(inference, 'infer', side_effect=RuntimeError('quota')), \
++        with patch.object(inference, 'infer', side_effect=inference.InferenceUnavailable('quota')), \
+              patch.object(media, 'call', return_value=(self.value(), 'gemini', 'flash')) as paid:
+-            result = vision._structured_table_read(Path('/fixture'), 'fixture')
++            result = vision._structured_table_read(self.image, 'fixture')
+         self.assertTrue(result['ok'], result)
+@@ -180,3 +186,3 @@
+              patch.object(media, 'call') as paid, self.assertRaises(inference.InferenceYield):
+-            vision._structured_table_read(Path('/fixture'), 'fixture')
++            vision._structured_table_read(self.image, 'fixture')
+         paid.assert_not_called()
+@@ -188,3 +194,3 @@
+             for name, result in (("get_detail_answer", ""),
+-                                 ("resolve_detail_image_path", Path('/fixture')),
++                                 ("resolve_detail_image_path", self.image),
+                                  ("is_local_vision_ready", True),
+@@ -194,3 +200,3 @@
+             stack.enter_context(patch.object(vision, 'set_detail_answer'))
+-            result = vision.detail_pass.__wrapped__(Path('/fixture'), 'fixture-sha',
++            result = vision.detail_pass.__wrapped__(self.image, 'fixture-sha',
+                 image_store.SCHEDULE_OCR_QUESTION, manifest_row={'message_key': 'fixture'})
+@@ -206,3 +212,3 @@
+         with patch.object(inference, 'infer', return_value=value) as model:
+-            result = vision._structured_table_read(Path('/fixture'), '完整读取通知和回执')
++            result = vision._structured_table_read(self.image, '完整读取通知和回执')
+         self.assertTrue(result['ok'], result)
+@@ -243,3 +249,3 @@
+              patch.object(media, 'call') as paid:
+-            result = vision._structured_table_read(Path('/fixture'), 'fixture')
++            result = vision._structured_table_read(self.image, 'fixture')
+         self.assertFalse(result['ok'])
