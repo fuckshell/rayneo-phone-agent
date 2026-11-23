@@ -1,0 +1,574 @@
+--- a/skills/wechat-antigravity/handoff.py
++++ b/skills/wechat-antigravity/handoff.py
+@@ -112,10 +112,19 @@
+ 
+ 
++def runtime_throttled(error):
++    text = str(error).lower()
++    return any(word in text for word in ("quota", "resource_exhausted", "rate limit", "429"))
++
++
+ def block_runtime(stdout, stderr, workspace, state_root=None):
+-    if not any(word in (stdout + stderr).lower() for word in ("quota", "resource_exhausted", "rate limit", "429")):
++    try:
++        error = json.loads(stdout).get("error", "")
++    except (ValueError, AttributeError):
++        error = ""
++    if not runtime_throttled(error or stderr):
+         return
+     path = Path(state_root or (Path(workspace) / "state/antigravity-screen")) / "provider.json"
+     state = json.loads(path.read_text()) if path.exists() else {}
+-    state.update(blocked=True, retry_after=time.time() + 600)
++    state.update(blocked=False, retry_after=time.time() + 60, quota_checked_at=0)
+     path.parent.mkdir(parents=True, exist_ok=True)
+     write_json(path, state)
+--- a/skills/wechat-antigravity/inference.py
++++ b/skills/wechat-antigravity/inference.py
+@@ -215,4 +215,13 @@
+ 
+ 
++def inference_cache_path(store, prompt, schema, model, source=None, sources=()):
++    cache_input = {'prompt': prompt, 'schema': schema, 'model': model,
++        'image': hashlib.sha256(source.read_bytes()).hexdigest() if source else None, 'version': 2}
++    if sources:
++        cache_input.update(images=[hashlib.sha256(p.read_bytes()).hexdigest() for p in sources], version=3)
++    digest = hashlib.sha256(json.dumps(cache_input, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
++    return store / 'inference-cache' / (digest + '.json')
++
++
+ def infer(prompt, *, image=None, images=None, schema=None, timeout=None, store=None,
+           runner=None, quota_check=None):
+@@ -237,10 +246,6 @@
+     # after its useful prose JSON. Only request structured output when the
+     # caller provides an actual contract; otherwise parse the prompted JSON.
+-    cache_input = {'prompt': prompt, 'schema': schema, 'model': model,
+-        'image': hashlib.sha256(source.read_bytes()).hexdigest() if source else None, 'version': 2}
+-    if sources:
+-        cache_input.update(images=[hashlib.sha256(p.read_bytes()).hexdigest() for p in sources], version=3)
+-    digest = hashlib.sha256(json.dumps(cache_input, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+-    cache = store / 'inference-cache' / (digest + '.json')
++    cache = inference_cache_path(store, prompt, schema, model, source, sources)
++    digest = cache.stem
+     # Completed read-only evidence needs no CLI lane or quota admission.
+     # Writers replace the file atomically; retain the check inside the lock
+@@ -264,5 +269,5 @@
+             raise InferenceUnavailable('subscription-quota-blocked')
+         if state.get('retry_after', 0) > time.time():
+-            raise InferenceUnavailable('subscription-cooling-down')
++            raise InferenceYield('provider-rate-limit-wait')
+         if state.get('blocked') or state.get('quota_checked_at', 0) + 600 <= time.time() or state.get('model') != model:
+             quota = quota_check(binary, model, store, env)
+@@ -313,7 +318,13 @@
+                 envelope = json.loads(stdout)
+                 if process.returncode or envelope.get('status') != 'SUCCESS' or envelope.get('denied_actions'):
+-                    if any(word in (stdout + stderr).lower() for word in
+-                           ('quota', 'resource_exhausted', 'rate limit', '429')):
+-                        state['blocked'] = True
++                    if (str(envelope.get('error', '')).startswith('invalid model selection')
++                            and envelope.get('num_turns') == 0):
++                        state.update(cooldown_reason='model-discovery-failed', retry_after=time.time() + 30)
++                        helper.write_json(state_path, state)
++                        raise InferenceYield('provider-rate-limit-wait')
++                    if helper.runtime_throttled(envelope.get('error', '')):
++                        state.update(blocked=False, retry_after=time.time() + 60, quota_checked_at=0)
++                        helper.write_json(state_path, state)
++                        raise InferenceYield('provider-rate-limit-wait')
+                     raise InferenceUnavailable('subscription-cli-failed')
+                 result = helper.parse_cli_result(envelope)
+--- a/skills/wechat-media/media_dispatch.py
++++ b/skills/wechat-media/media_dispatch.py
+@@ -88,7 +88,8 @@
+             env = os.environ.copy()
+             # Never trust an inherited global burst flag.
+-            env.pop('WECHAT_MEDIA_API_BURST', None)
+-            if burst:
+-                env['WECHAT_MEDIA_API_BURST'] = '1'
++            if env.get('WECHAT_MEDIA_API_BURST') != '0':
++                env.pop('WECHAT_MEDIA_API_BURST', None)
++                if burst:
++                    env['WECHAT_MEDIA_API_BURST'] = '1'
+             command = [sys.executable, str(script), '--once', '--item-id', row['id']]
+             if message_key:
+--- a/skills/wechat-calendar/antigravity_screen.py
++++ b/skills/wechat-calendar/antigravity_screen.py
+@@ -13,4 +13,8 @@
+ 
+ WORKSPACE = Path.home() / ".openclaw/workspace-wechat"
++
++
++class ScreenProviderUnavailable(ValueError):
++    """The subscription CLI attempted screening but could not provide a result."""
+ 
+ 
+@@ -48,4 +52,5 @@
+ 
+ def _screen(request, *, store=None, runner=None, quota_check=None):
++    from inference import InferenceYield
+     helper = handoff_module()
+     runner = runner or subprocess.Popen
+@@ -62,5 +67,5 @@
+             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+         except BlockingIOError:
+-            raise ValueError("subscription-screen-busy")
++            raise InferenceYield("subscription-worker-busy")
+         # A corrupt circuit must not trigger fresh calls.
+         state = json.loads(state_path.read_text()) if state_path.exists() else {}
+@@ -70,5 +75,5 @@
+             # provider evidence without polling or rewriting an active block.
+             reset_at = float(state.get("quota_reset_at", 0) or _quota_reset_at(state.get("quota")))
+-            if reset_at and now >= reset_at:
++            if now >= (reset_at or state.get("retry_after") or now):
+                 state.pop("blocked", None)
+                 state.pop("quota_reset_at", None)
+@@ -79,7 +84,7 @@
+                 helper.write_json(state_path, state)
+             else:
+-                raise ValueError("subscription-screen-quota-blocked")
++                raise ScreenProviderUnavailable("subscription-screen-quota-blocked")
+         if state.get("retry_after", 0) > now:
+-            raise ValueError("subscription-screen-cooling-down")
++            raise InferenceYield("provider-rate-limit-wait")
+         # /usage starts a CLI process too: cache a successful preflight for 10min.
+         if state.get("quota_checked_at", 0) + 600 <= time.time() or state.get("model") != model:
+@@ -95,5 +100,5 @@
+                     state.pop("quota_reset_at", None)
+                 helper.write_json(state_path, state)
+-                raise ValueError("subscription-screen-" + str(quota.get("error", "quota-unavailable")))
++                raise ScreenProviderUnavailable("subscription-screen-" + str(quota.get("error", "quota-unavailable")))
+             helper.write_json(state_path, state)
+         schema = json.dumps(request["format"], ensure_ascii=False)
+@@ -118,7 +123,13 @@
+                 if process.returncode or envelope.get("status") != "SUCCESS" or envelope.get("denied_actions"):
+                     # Provider errors cannot become a negative relevance judgment.
+-                    error_text = (stdout + stderr).lower()
+-                    if any(word in error_text for word in ("quota", "resource_exhausted", "rate limit", "429")):
+-                        state["blocked"] = True
++                    error_text = str(envelope.get("error", "")).lower()
++                    if error_text.startswith("invalid model selection") and envelope.get("num_turns") == 0:
++                        state.update(cooldown_reason="model-discovery-failed", retry_after=time.time() + 30)
++                        helper.write_json(state_path, state)
++                        raise InferenceYield("provider-rate-limit-wait")
++                    if helper.runtime_throttled(error_text):
++                        state.update(blocked=False, retry_after=time.time() + 60, quota_checked_at=0)
++                        helper.write_json(state_path, state)
++                        raise InferenceYield("provider-rate-limit-wait")
+                     raise ValueError("subscription-screen-cli-failed")
+                 value = envelope.get("structured_output")
+@@ -139,9 +150,9 @@
+                 state["retry_after"] = time.time() + 600
+                 helper.write_json(state_path, state)
+-                raise ValueError("subscription-screen-timeout") from None
+-            except (OSError, ValueError, KeyError, TypeError):
++                raise ScreenProviderUnavailable("subscription-screen-timeout") from None
++            except (ValueError, FileNotFoundError):
+                 state["retry_after"] = time.time() + 600
+                 helper.write_json(state_path, state)
+-                raise ValueError("subscription-screen-unavailable") from None
++                raise ScreenProviderUnavailable("subscription-screen-unavailable") from None
+ 
+ 
+--- a/skills/wechat-calendar/context_calendar_pipeline.py
++++ b/skills/wechat-calendar/context_calendar_pipeline.py
+@@ -304,4 +304,5 @@
+ 
+ def screen_relevance(bundle):
++    from antigravity_screen import ScreenProviderUnavailable
+     from inference import InferenceYield
+     mode = os.environ.get("WECHAT_CALENDAR_SCREEN_PROVIDER", "local")
+@@ -312,5 +313,5 @@
+     except InferenceYield:
+         raise
+-    except Exception:
++    except ScreenProviderUnavailable:
+         # A subscription outage used to send every ordinary message into the
+         # full multi-turn calendar agent. Retain model relevance screening on
+@@ -619,6 +620,9 @@
+     run_id = uuid.uuid4().hex
+     session_key = f"agent:wechat-calendar:calendar:{request_id}:{run_id}"
++    from inference import InferenceYield
+     try:
+         return _execute_online(bundle, screening, run_id, session_key)
++    except InferenceYield:
++        raise
+     except Exception as exc:
+         code = session_provider_error(session_key)
+@@ -1079,22 +1083,12 @@
+             screening = screen_relevance(bundle)
+         except ScreeningUnavailable as exc:
+-            # Relevance screening is an optimisation, never the authority for
+-            # a calendar decision. A screen-provider outage used to strand
+-            # ordinary text in retry before the authoritative Gemini/OpenClaw
+-            # run could inspect the message and produce a business receipt.
+-            # Preserve the outage as evidence, then fail open to the full
+-            # online decision. That decision still has to pass the existing
+-            # provider, atomic journal and Feishu receipt validation below.
+-            screening = {
+-                "relevance": "uncertain",
+-                "reason": "screen-provider-unavailable-open-online",
+-                "screening_error": str(exc)[:160],
+-                "screening_provider": "unavailable",
+-            }
++            return {"ok": False, "retryable": True, "reason": "screening-unavailable",
++                    "detail": str(exc)[:160], "path": "calendar-screen"}
+         except Exception as exc:
+             from inference import InferenceYield
+             if isinstance(exc, InferenceYield):
+-                return idle_retry_yield_result()
+-            screening = {"relevance": "uncertain", "reason": f"local-screen-unavailable:{type(exc).__name__}"}
++                return {**idle_retry_yield_result(), "detail": str(exc)}
++            return {"ok": False, "retryable": True, "reason": "screening-unavailable",
++                    "detail": type(exc).__name__, "path": "calendar-screen"}
+         if screening.get("relevance") == "irrelevant":
+             try:
+@@ -1193,4 +1187,7 @@
+                     result["semantic_evidence_key"] = semantic_key
+                     return commit_context_result(directory, key, result)
++        from inference import InferenceYield
++        if isinstance(exc, InferenceYield):
++            return {**idle_retry_yield_result(), "detail": str(exc)}
+         code = str(exc).removeprefix("calendar-gateway-")
+         retryable = not isinstance(exc, OnlineDecisionError) and (
+--- a/skills/wechat-calendar/antigravity_calendar.py
++++ b/skills/wechat-calendar/antigravity_calendar.py
+@@ -57,4 +57,11 @@
+     response = delegate(prompt, f"calendar:{request_id}", timeout)
+     if not response.get("ok"):
++        if response.get("started") is False and response.get("error") in {
++            "subscription-cooling-down", "subscription-worker-busy", "phone-worker-busy",
++            "temporary-new-messages-pending", "provider-rate-limit-wait",
++        }:
++            from inference import InferenceYield
++            reason = response["error"]
++            raise InferenceYield("provider-rate-limit-wait" if reason == "subscription-cooling-down" else reason)
+         if mode == "antigravity-prefer" and _can_fallback_to_api(response):
+             return None
+--- a/skills/wechat-calendar/validate_calendar_final_receipt.py
++++ b/skills/wechat-calendar/validate_calendar_final_receipt.py
+@@ -153,5 +153,4 @@
+     result = copy.deepcopy(job['result'])
+     background_key = completed_background_session(job) if job.get('last_error') == 'background-running' else None
+-    handoff = completed_antigravity_handoff(job) if job.get('last_error') == 'online-calendar-failed' else None
+     matched = []
+     for branch in ('calendar','vision_calendar'):
+@@ -165,9 +164,27 @@
+         malformed = (job.get('last_error') == 'online-calendar-failed' and
+                      failed.get('detail') == 'online-final-decision-invalid')
+-        completed_handoff = bool(handoff and branch == 'calendar' and
++        completed_handoff = bool(job.get('last_error') == 'online-calendar-failed' and branch == 'calendar' and
+                                  failed.get('detail') == 'calendar-antigravity-task-input-conflict')
+         throttle = (job.get('last_error') in ('online-rate-limit','calendar-write-rate-limit') and
+                     failed.get('reason') == job.get('last_error'))
++        if (branch == 'vision_calendar' and job.get('last_error') == 'online-calendar-failed'
++                and failed.get('detail') == 'calendar-antigravity-permission-denied-outcome-unknown'):
++            from reconcile_existing_arrangement import decision as verify_arrangement
++            import re
++            if not re.fullmatch(r'[a-f0-9]{24}', job['id']):
++                raise ValueError('invalid-job-id')
++            pair = json.loads((R/'state/manual-repair-audit/readonly-arrangements'/
++                               (job['id'] + '.json')).read_text())
++            decision = verify_arrangement(job, pair['event_uid'], pair['todo_uid'])
++            c.validate_online_decision(decision)
++            key = failed['session_key']
++            assert not wrapper.get('receipt_required'), 'legacy-receipt-wrapper-unsupported'
++            wrapper.update(ok=True, exit_code=0, result={'ok':True, **decision,
++                           'path':'existing-arrangement-remote-readback','session_key':key})
++            wrapper.pop('reason', None)
++            matched.append({'branch':branch, 'session_key':key, 'decision':decision})
++            continue
+         if completed_handoff:
++            handoff = completed_antigravity_handoff(job)
+             decision = handoff['decision']
+             handoff_key = 'antigravity:' + handoff['request_id']
+--- a/skills/wechat-calendar/test_triage_fallback_budget.py
++++ b/skills/wechat-calendar/test_triage_fallback_budget.py
+@@ -19,4 +19,7 @@
+         self.path = Path(temp.name) / 'fixture.png'
+         Image.new('RGB', (100, 160), 'white').save(self.path)
++        cache = patch('image_store.cache_triage_photo')
++        cache.start()
++        self.addCleanup(cache.stop)
+         self.sha = hashlib.sha256(self.path.read_bytes()).hexdigest()
+         self.row = dict(file_sha=self.sha, captured_tier='thumbnail',
+@@ -47,5 +50,6 @@
+ 
+     def test_successful_api_fallback_still_returns_actual_classification(self):
+-        response = dict(relevance='irrelevant', content_type='photo', reason='可见一只猫')
++        response = dict(relevance='irrelevant', content_type='photo', reason='可见一只猫',
++                        confidence=.9, summary='一只橘猫卧在窗台上。', evidence=['窗台上趴着一只橘色猫。'])
+         with patch('inference.infer', side_effect=InferenceUnavailable('subscription-quota-blocked')), \
+              patch('media_api_burst.call', return_value=(response, 'gemini', 'gemini-3.8-flash')) as api, \
+--- a/skills/wechat-calendar/test_antigravity_screen.py
++++ b/skills/wechat-calendar/test_antigravity_screen.py
+@@ -8,4 +8,7 @@
+ import antigravity_screen as screen
+ import context_calendar_pipeline as pipeline
++
++
++from inference import InferenceYield
+ 
+ 
+@@ -49,5 +52,5 @@
+                     screen.screen(self.request(), store=tmp, runner=lambda *a, **kw: self.process(value, **extra),
+                                   quota_check=lambda *a: {"ok": True})
+-                with self.assertRaisesRegex(ValueError, "cooling-down"):
++                with self.assertRaisesRegex(InferenceYield, "provider-rate-limit-wait"):
+                     screen.screen(self.request(), store=tmp, runner=lambda *a, **kw: self.fail("must not launch"))
+ 
+@@ -120,5 +123,5 @@
+         request=pipeline.local_screen_request({},arrangements=[])
+         with patch.dict(os.environ, {"WECHAT_CALENDAR_SCREEN_PROVIDER":"antigravity-prefer"}), \
+-             patch.object(screen,"screen",side_effect=ValueError("quota-blocked")) as subscription, \
++             patch.object(screen,"screen",side_effect=screen.ScreenProviderUnavailable("quota-blocked")) as subscription, \
+              patch.object(pipeline,"local_screen_request",return_value=request), \
+              patch("media_api_burst.call",return_value=(response,"gemini","gemini-3.8-flash")) as api:
+--- a/skills/wechat-calendar/test_parallel_screening.py
++++ b/skills/wechat-calendar/test_parallel_screening.py
+@@ -10,13 +10,13 @@
+ 
+ class ParallelScreeningTest(unittest.TestCase):
+-    def test_burst_text_screen_uses_api_without_subscription(self):
++    def test_burst_flag_keeps_subscription_first(self):
+         answer = {"relevance": "irrelevant", "reason": "ordinary chat", "unchanged_event_uids": []}
+         with patch.dict(os.environ, {"WECHAT_MEDIA_API_BURST": "1"}), \
+              patch.object(pipeline, "local_screen_request", return_value={"messages": [{"content": "screen this"}]}), \
+              patch("media_api_burst.call", return_value=(answer, "gemini", "flash")) as api, \
+-             patch("antigravity_screen.screen", side_effect=AssertionError("subscription called")):
++             patch("antigravity_screen.screen", return_value=answer):
+             result = pipeline.screen_relevance({})
+-        api.assert_called_once_with("screen this")
+-        self.assertEqual(result["provider"], "gemini")
++        api.assert_not_called()
++        self.assertEqual(result, answer)
+ 
+     def test_parallel_screens_preserve_both_receipts(self):
+--- a/skills/wechat-calendar/test_screen_api_fallback.py
++++ b/skills/wechat-calendar/test_screen_api_fallback.py
+@@ -6,4 +6,5 @@
+ from unittest.mock import patch
+ import context_calendar_pipeline as c
++from antigravity_screen import ScreenProviderUnavailable
+ from inference import InferenceYield
+ from flash_backlog_api import FlashCallError
+@@ -23,5 +24,5 @@
+         request=c.local_screen_request({},arrangements=[])
+         request['messages'][0]['content']='fixture'
+-        with patch.object(c,'screen_locally',side_effect=ValueError('quota')), \
++        with patch.object(c,'screen_locally',side_effect=ScreenProviderUnavailable('quota')), \
+              patch.object(c,'local_screen_request',return_value=request), \
+              patch('media_api_burst.call',return_value=(response,'gemini','gemini-3.8-flash')) as api:
+@@ -40,5 +41,5 @@
+         response={'relevance':'irrelevant','reason':'fixture','context_indices':[]}
+         request=c.local_screen_request({},arrangements=[])
+-        with patch.object(c,'screen_locally',side_effect=ValueError('quota')), \
++        with patch.object(c,'screen_locally',side_effect=ScreenProviderUnavailable('quota')), \
+              patch.object(c,'local_screen_request',return_value=request), \
+              patch('media_api_burst.call',return_value=(response,'gemini','gemini-3.8-flash')) as api, \
+@@ -49,5 +50,5 @@
+     def test_phone_preemption_during_api_fallback_is_preserved(self):
+         request=c.local_screen_request({},arrangements=[])
+-        with patch.object(c,'screen_locally',side_effect=ValueError('quota')), \
++        with patch.object(c,'screen_locally',side_effect=ScreenProviderUnavailable('quota')), \
+              patch.object(c,'local_screen_request',return_value=request), \
+              patch('media_api_burst.call',side_effect=InferenceYield('phone')) as api, \
+@@ -61,4 +62,13 @@
+             c.screen_relevance({})
+         api.assert_not_called()
++
++    def test_local_error_never_spends(self):
++        with patch.object(c, 'screen_locally', side_effect=KeyError('fixture')), patch('media_api_burst.call') as api:
++            with self.assertRaises(KeyError):
++                c.screen_relevance({})
++            api.assert_not_called()
++        result, online = self.run_entry(KeyError('fixture'))
++        self.assertFalse(result['ok'])
++        online.assert_not_called()
+ 
+     def run_entry(self,screen):
+@@ -77,8 +87,9 @@
+         return result,online
+ 
+-    def test_api_screen_failure_fails_open_to_authoritative_calendar_agent(self):
++    def test_paid_screen_failure_does_not_launch_second_agent(self):
+         result,online=self.run_entry(c.ScreeningUnavailable('flash-http-429'))
+-        online.assert_called_once();self.assertTrue(result['ok'])
+-        self.assertEqual(result['status'],'executed')
++        online.assert_not_called()
++        self.assertFalse(result['ok'])
++        self.assertEqual(result['reason'],'screening-unavailable')
+ 
+     def test_verified_irrelevant_screen_finishes_without_full_agent(self):
+--- /dev/null
++++ b/skills/wechat-calendar/test_subscription_routing.py
+@@ -0,0 +1,101 @@
++"""Billing routing regressions with isolated stores and no network calls."""
++from contextlib import ExitStack
++import fcntl
++import json
++import os
++from pathlib import Path
++import tempfile
++import unittest
++from unittest.mock import Mock, patch
++
++import antigravity_calendar
++import antigravity_screen
++import context_calendar_pipeline as pipeline
++import inference
++import media_dispatch
++import provider_fallback
++import reconcile_existing_arrangement as arrangement
++
++
++class SubscriptionRoutingTests(unittest.TestCase):
++    def test_cli_failure_then_cooldown_then_quota_recheck(self):
++        for error in ('HTTP 429', 'invalid model selection: offline'):
++            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
++                child = Mock(returncode=1)
++                child.communicate.return_value = (json.dumps(dict(status='ERROR', error=error, num_turns=0)), '')
++                runner = stack.enter_context(patch.object(inference.subprocess, 'Popen', return_value=child))
++                helper = inference.helper_module()
++                helper.membership_quota = Mock(side_effect=[{'ok': True}, {'ok': False, 'error': 'membership-quota-exhausted'}])
++                stack.enter_context(patch.object(inference, 'helper_module', return_value=helper))
++                paid = stack.enter_context(patch('media_api_burst.call', return_value=({'answer':'fixture'}, 'gemini', 'flash')))
++                for _ in range(2):
++                    with self.assertRaises(inference.InferenceYield):
++                        provider_fallback.infer('fixture', store=tmp)
++                paid.assert_not_called()
++                runner.assert_called_once()
++                with patch('time.time', return_value=10**10):
++                    self.assertEqual(provider_fallback.infer('fixture', store=tmp)['answer'], 'fixture')
++                paid.assert_called_once()
++                self.assertEqual(helper.membership_quota.call_count, 2)
++
++    def test_screen_startup_and_short_throttle_yield_before_fallback(self):
++        for error in ('invalid model selection: offline', 'HTTP 429'):
++            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
++                child = Mock(returncode=1)
++                child.communicate.return_value = (json.dumps(dict(error=error, num_turns=0)), '')
++                runner = Mock(return_value=child)
++                request = {'format':{}, 'messages':[{'content':'fixture'}]}
++                stack.enter_context(patch.object(pipeline, 'screen_locally', side_effect=lambda _: antigravity_screen.screen(
++                    request, store=tmp, runner=runner, quota_check=lambda *a: {'ok':True})))
++                paid = stack.enter_context(patch('media_api_burst.call'))
++                for _ in range(2):
++                    with self.assertRaises(inference.InferenceYield):
++                        pipeline.screen_relevance({})
++                paid.assert_not_called()
++                runner.assert_called_once()
++
++    def test_occupied_lane_never_spends(self):
++        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'WECHAT_AGY_LOCK_TIMEOUT':'0'}):
++            root = Path(tmp) / 'shared-worker'
++            root.mkdir()
++            with (root/'worker.lock').open('a') as lock, patch('media_api_burst.call') as paid:
++                fcntl.flock(lock, fcntl.LOCK_EX)
++                with self.assertRaisesRegex(inference.InferenceYield, 'worker-busy'):
++                    provider_fallback.infer('fixture', store=tmp)
++                paid.assert_not_called()
++
++    def test_calendar_executor_preserves_yield(self):
++        for reason in ('subscription-cooling-down', 'phone-worker-busy', 'subscription-worker-busy'):
++            with self.subTest(reason=reason), ExitStack() as stack:
++                stack.enter_context(patch.dict(os.environ, {'WECHAT_CALENDAR_EXECUTOR':'antigravity-prefer'}))
++                stack.enter_context(patch.object(antigravity_calendar,'delegate', return_value=dict(ok=False, started=False, error=reason)))
++                stack.enter_context(patch.object(pipeline, 'online_evidence', return_value={}))
++                stack.enter_context(patch.object(pipeline, 'build_online_prompt', return_value='fixture'))
++                stack.enter_context(patch('phone_priority.phone_active', return_value=False))
++                gateway = stack.enter_context(patch.object(pipeline, 'gateway_settings'))
++                with self.assertRaises(inference.InferenceYield):
++                    pipeline.execute_online({}, {}, 'fixture')
++                gateway.assert_not_called()
++
++    def test_dispatch_preserves_paid_disable_even_with_backlog(self):
++        with ExitStack() as stack:
++            stack.enter_context(patch.dict(os.environ, {'WECHAT_MEDIA_API_BURST':'0'}))
++            stack.enter_context(patch('cached_photo_completion.reconcile'))
++            stack.enter_context(patch.object(media_dispatch, 'burst_allowed', return_value=True))
++            stack.enter_context(patch.object(media_dispatch, 'ordered_items', return_value=[{'id':'fixture'}]))
++            spawn = stack.enter_context(patch.object(media_dispatch.subprocess, 'Popen'))
++            stack.enter_context(patch.object(media_dispatch.time, 'sleep'))
++            self.assertEqual(media_dispatch.dispatch('fixture.py', list, lambda:False, 1), 1)
++            self.assertEqual(spawn.call_args.kwargs['env']['WECHAT_MEDIA_API_BURST'], '0')
++
++    def test_changed_remote_evidence_cannot_reuse_previous_decision(self):
++        with tempfile.TemporaryDirectory() as tmp, patch.object(arrangement, 'ROOT', Path(tmp)), patch.object(inference,'infer') as run:
++            store = Path(tmp)/'state/antigravity-screen'
++            proof = inference.inference_cache_path(store, 'first', None, inference.flash_model())
++            proof.parent.mkdir(parents=True)
++            proof.write_text(json.dumps(dict(status='noop',reason='covered',event_uid='e',todo_uid='t')))
++            with patch.object(arrangement, 'evidence', side_effect=[('first',{},{}),('changed',{}, {})]):
++                self.assertEqual(arrangement.decision({}, 'e','t')['status'], 'noop')
++                with self.assertRaises(FileNotFoundError):
++                    arrangement.decision({}, 'e','t')
++            run.assert_not_called()
+--- /dev/null
++++ b/skills/wechat-calendar/reconcile_existing_arrangement.py
+@@ -0,0 +1,68 @@
++"""Resolve a denied calendar run against an operator-selected live event and task.
++
++Preparation runs subscription-only inference. Verification re-reads the same
++remote records and accepts only the exact previously generated inference result.
++"""
++import hashlib
++import json
++from pathlib import Path
++
++from calendar_tool import load_state, query_live_events
++from feishu_lib import get_access_token, get_task, feishu_due_to_local
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++def evidence(job, event_uid, todo_uid):
++    from validate_calendar_final_receipt import _embedded_task_payload, verify_identity
++    failed = job['result']['vision_calendar']['result']
++    if failed.get('detail') != 'calendar-antigravity-permission-denied-outcome-unknown':
++        raise ValueError('unsupported-failure')
++    task_id = 'calendar:' + failed['session_key'].rsplit(':', 1)[0]
++    folder = ROOT / 'handoffs/antigravity' / hashlib.sha256(task_id.encode()).hexdigest()
++    task = json.loads((folder / 'task.json').read_text())
++    if task['task_id'] != task_id:
++        raise ValueError('handoff-task-mismatch')
++    message = _embedded_task_payload(task['prompt'])['evidence']['message']
++    verify_identity(job['event'], message, failed)
++    state = load_state()
++    events = query_live_events(state, uid_filter=event_uid, compact=True)
++    matches = [e for e in events if e.get('uid') == event_uid and e.get('remote_verified') is True]
++    if len(matches) != 1:
++        raise ValueError('live-event-not-unique')
++    event = {k: matches[0].get(k) for k in ('uid','event_id','title','start_time','end_time','location','recurrence')}
++    local = state['todo_items'][todo_uid]
++    guid = state['feishu_sync']['tasks'][todo_uid]
++    token, _ = get_access_token(prefer_user=True)
++    response = get_task(token, guid)
++    remote = response.get('data', {}).get('task') or {}
++    due = feishu_due_to_local(remote)
++    if (response.get('code') != 0 or remote.get('guid') != guid or remote.get('summary') != local['title']
++            or due != local['due_date'] or not remote.get('completed_at')
++            or (str(remote['completed_at']) != '0') != bool(local.get('completed_at'))):
++        raise ValueError('live-todo-mismatch')
++    todo = dict(uid=todo_uid, task_guid=guid, title=local['title'], due_date=due, completed_at=remote['completed_at'])
++    payload = dict(message=message, current_event=event, current_todo=todo)
++    prompt = ('只读核验：从原消息和上下文逐项判断，列出的飞书日程和待办是否已满足这条消息的全部要求。'
++              '时间地点、适用人员、登记要求或其他动作有缺失或变化时返回 needs-review。'
++              '不执行任何工具，不写入。若全部覆盖返回 status=noop、event_uid、todo_uid、reason；否则返回 status=needs-review 和原因。\n'
++              + json.dumps(payload, ensure_ascii=False, sort_keys=True))
++    return prompt, event, todo
++
++
++def decision(job, event_uid, todo_uid, *, prepare=False):
++    import inference
++    prompt, event, todo = evidence(job, event_uid, todo_uid)
++    store = ROOT / 'state/antigravity-screen'
++    # Use the inference module's actual cache identity. Verification never
++    # reserves a worker or starts a model while ingest holds a repair snapshot.
++    value = inference.infer(prompt) if prepare else None
++    cache = inference.inference_cache_path(store, prompt, None, inference.flash_model())
++    digest = cache.stem
++    cached = json.loads(cache.read_text())
++    if (prepare and cached != value or cached.get('status') != 'noop' or not cached.get('reason')
++            or cached.get('event_uid') != event_uid or cached.get('todo_uid') != todo_uid):
++        raise ValueError('subscription-did-not-confirm-arrangement')
++    return dict(status='noop', reason=cached['reason'], receipts=[], coverage={'required':False},
++                verified_event=event, todo_result={**todo,'ok':True,'remote_verified':True},
++                inference_digest=digest, provider=inference.PROVIDER)

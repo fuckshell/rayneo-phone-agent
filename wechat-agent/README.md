@@ -8,3 +8,5 @@
 - `memory-repair.js`：从原事件计算标识，检查记忆任务的恢复凭据、次数和结果。调度器负责保存状态。
 
 从仓库根目录运行 `node --test wechat-agent/tests/policy.test.js`。测试只使用合成事件。
+
+`subscription-routing.patch` 适用于已有对应 Python 业务模块的工作区。从工作区根目录使用 `git apply --check <补丁路径>` 核对版本。补丁让 CLI 忙、短时限流和零轮模型发现失败的任务等待订阅服务，保留真实配额耗尽时的后备路径。日历回执校验会重新读取原任务对应的日程和待办，远端证据变动后需要重新核验。
