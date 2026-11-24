@@ -18,3 +18,9 @@
 `subscription-quota-preflight.patch` 修复订阅 CLI 的额度预检。查不到额度时等待 30 秒再查。确认额度耗尽后仍使用既有后备。补丁适用于业务工作区。
 
 `middle-path-refresh.patch` 适用于已有中清图校验函数的 Node 服务仓库。队列中的图片仍指向缩略图时，按消息标识和实际文件 SHA-256 更新下游路径，保留业务结果、重试次数和澄清记录。
+
+日历初筛与表格识别的后续修复发布在同一项目的服务仓库。按提交顺序可查看差异和测试：
+
+- [只读初筛按订阅可用性重试](https://github.com/fuckshell/key_ctrler/commit/0cc45a701de804172b8f82733ec590c999c75fe1) 修复单次本地超时导致整个订阅通道暂停的问题。
+- [隔离单次初筛的输出错误](https://github.com/fuckshell/key_ctrler/commit/ca6540efa69576d3103e62837eb2871ec7d7011f) 让下一条消息可以继续使用订阅 CLI。
+- [完整表格的订阅读取时限](https://github.com/fuckshell/key_ctrler/commit/44767a9069fc38c915572ca85b78d2403fb2be26) 给表格逐格转写最多六分钟，超时后仍使用已配置的后备通道。
